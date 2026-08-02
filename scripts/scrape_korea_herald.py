@@ -113,12 +113,17 @@ BODY_SELECTOR_CANDIDATES = [
     ("class", "art_body"),
 ]
 
-# Confirmed live (2026 template): these divs are "related articles" / nav
-# widgets that happen to contain several <p> tags, NOT the article body.
-# The generic largest-div fallback must never mistake one of these for
-# real content -- that would silently write the wrong text as "success".
-BODY_FALLBACK_EXCLUDE_CLASSES = {"recommended_swiper_wrap", "recommended_swiper", "div_layout"}
-BODY_FALLBACK_EXCLUDE_ID_PREFIXES = ("category-",)
+# Confirmed live (2026 template): these divs are "related articles" / "in
+# this section" recirculation widgets that happen to contain several <p>
+# tags, NOT the article body -- e.g. div.div_layout and div#category-N
+# showed the SAME unrelated headlines ("Yangsan hits 42.5 C...") across
+# multiple different articles, confirming they're site-wide chrome, not
+# per-article content. These are decomposed (removed) from the soup before
+# ANY extraction runs (including trafilatura), not just excluded from the
+# BS4 fallback -- trafilatura was otherwise picking up the widget instead
+# of the real (short) article body on at least one confirmed live page.
+NOISE_CONTAINER_CLASSES = {"recommended_swiper_wrap", "recommended_swiper", "div_layout"}
+NOISE_CONTAINER_ID_PREFIXES = ("category-",)
 
 # Confirmed live: JSON-LD headline and og:title both carry a trailing
 # " - The Korea Herald" suffix (JSON-LD also HTML-entity-encodes
@@ -298,12 +303,34 @@ def extract_meta_tag_metadata(soup):
     }
 
 
-def _is_excluded_div(div):
+def _is_noise_div(div):
     classes = set(div.get("class") or [])
-    if classes & BODY_FALLBACK_EXCLUDE_CLASSES:
+    if classes & NOISE_CONTAINER_CLASSES:
         return True
     div_id = div.get("id") or ""
-    return any(div_id.startswith(p) for p in BODY_FALLBACK_EXCLUDE_ID_PREFIXES)
+    return any(div_id.startswith(p) for p in NOISE_CONTAINER_ID_PREFIXES)
+
+
+def strip_known_noise(soup):
+    """Remove known recirculation-widget/nav-chrome containers from the
+    soup IN PLACE, before any extraction (trafilatura or BS4) sees the
+    HTML. Confirmed live: trafilatura can otherwise mistake one of these
+    widgets for the real article body, especially on short articles
+    surrounded by relatively text-heavy "related articles" modules.
+    Also strips <nav>/<header>/<footer>/<aside> as cheap extra insurance
+    (trafilatura already excludes these by tag semantics, but the BS4
+    fallback path doesn't, so this keeps both paths consistent)."""
+    for div in soup.find_all("div"):
+        # decomposing a parent div also invalidates its descendants, which
+        # may still be sitting in this pre-computed find_all() list
+        if div.parent is None:
+            continue
+        if _is_noise_div(div):
+            div.decompose()
+    for tag_name in ("nav", "header", "footer", "aside"):
+        for el in soup.find_all(tag_name):
+            el.decompose()
+    return soup
 
 
 def extract_body_bs4(soup):
@@ -330,7 +357,7 @@ def extract_body_bs4(soup):
 
     best_text, best_len = None, 0
     for div in soup.find_all("div"):
-        if _is_excluded_div(div):
+        if _is_noise_div(div):
             continue
         paragraphs = [p.get_text(" ", strip=True) for p in div.find_all("p", recursive=False)]
         paragraphs = [p for p in paragraphs if p]
@@ -356,7 +383,7 @@ def clean_title(title):
 
 def extract_article(html, url):
     """
-    Returns a dict with title, author, section, body_text, word_count,
+    Returns a dict with title, author, body_text,
     publication_date, updated_date, date_flag, extraction_method.
     """
     soup = BeautifulSoup(html, "html.parser")
@@ -364,10 +391,16 @@ def extract_article(html, url):
     jsonld = extract_jsonld_metadata(soup)
     meta = extract_meta_tag_metadata(soup)
 
+    # Remove known recirculation-widget/nav chrome BEFORE any body
+    # extraction runs, so neither trafilatura nor the BS4 fallback can
+    # mistake it for article content (see NOISE_CONTAINER_CLASSES above).
+    strip_known_noise(soup)
+    cleaned_html = str(soup)
+
     # trafilatura: primary body extractor + secondary metadata source
     traf_json = trafilatura.extract(
-        html, url=url, with_metadata=True, output_format="json",
-        include_comments=False,
+        cleaned_html, url=url, with_metadata=True, output_format="json",
+        include_comments=False, favor_precision=True,
     )
     traf_data = json.loads(traf_json) if traf_json else {}
     traf_body = (traf_data.get("text") or "").strip()
