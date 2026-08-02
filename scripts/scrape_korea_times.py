@@ -1,56 +1,55 @@
 """
-Scrapes a list of The Korea Herald article URLs into a structured CSV corpus
+Scrapes a list of The Korea Times article URLs into a structured CSV corpus
 for manual content-coding.
 
 INPUT:  urls.txt          (one URL per line, working directory)
-OUTPUT: korea_herald_corpus.csv   one row per unique input URL (success or failed)
-        scrape_failures.csv       one row per failed URL, with error detail
-        raw_html/<article_id>.html   raw HTML of every successfully fetched page
+OUTPUT: korea_times_corpus.csv   one row per unique input URL (success or failed)
+        korea_times_failures.csv one row per failed URL, with error detail
+        raw_html_koreatimes/<article_id>.html   raw HTML of every successfully fetched page
 
 --------------------------------------------------------------------------
 EXTRACTION NOTES (read this before running on your full list)
 --------------------------------------------------------------------------
-Verified against 4 live current-template articles (Jan 2026, /article/<id>
-URLs). Confirmed findings baked into the code below:
+Verified against 2 live articles spanning nearly 20 years (2007 and 2026),
+same JSON-LD-first / meta-second / trafilatura-third pipeline as the Korea
+Herald scraper, adapted for these confirmed Korea Times-specific findings:
 
-    - JSON-LD (schema.org NewsArticle) is present and reliable for
-      datePublished, dateModified (empty string when never updated,
-      never absent), and author.name. It has no articleSection field.
-    - og:title (meta) is clean; JSON-LD's headline carries the same text
-      but with a " - The Korea Herald" suffix and &apos;-style HTML
-      entities instead of real characters -- both handled by clean_title().
-    - article:section (meta) and trafilatura's "categories" are USELESS
-      for section -- both just echo "The Korea Herald" (the site name),
-      not a real section. The real section ("K-pop", "National", "English
-      Cafe", ...) lives in the first ".category" breadcrumb element on the
-      page (extract_section_from_breadcrumb()); a second ".category" match
-      is typically a content-format tag like "Quick Read", not a section.
-    - trafilatura's body extraction was clean on all 4 samples (no nav or
-      "recommended articles" widget contamination) -- it's the primary
-      body extractor. The BS4 fallback path (BODY_SELECTOR_CANDIDATES)
-      remains unconfirmed against a real page since trafilatura hasn't
-      failed yet in samples; its generic largest-div fallback explicitly
-      excludes known related-articles/nav widget containers
-      (BODY_FALLBACK_EXCLUDE_CLASSES/IDS) so it can't silently return the
-      wrong content as a false "success" if it ever does trigger.
+    - JSON-LD headline is already clean; it's og:title that carries the
+      " - The Korea Times" suffix (the OPPOSITE of Korea Herald, where
+      og:title was clean and JSON-LD had the suffix). clean_title() strips
+      it regardless of which source is used, so this doesn't matter much
+      in practice, but the priority order is flipped vs. Korea Herald.
+    - Author is unreliable on old articles: on the 2007 sample, BOTH
+      JSON-LD author.name and meta article:author report "The Korea
+      Times" (the site name) instead of a real byline -- treated as junk
+      (clean_author()). The real author only appears as literal text at
+      the very start of body_text ("By Cathy Rose A. Garcia\nStaff
+      Reporter\n..."), which also means it was leaking into body_text as
+      noise. extract_byline_fallback() pulls a leading "By NAME" line
+      (plus an immediately-following short role line like "Staff
+      Reporter") out of body_text into author when metadata is junk/empty.
+      The 2026 sample has a real author in metadata and no byline leakage,
+      so this fallback is a no-op there.
+    - dateModified equals datePublished exactly when an article was never
+      actually revised (Korea Herald instead left dateModified as an empty
+      string in that case) -- updated_date is only populated when it's
+      genuinely different from publication_date, otherwise every single
+      row would falsely look "updated".
+    - No related-articles/recirculation widget contamination observed in
+      either sample (trafilatura's extracted length closely matches the
+      full nested-container length), so NOISE_CONTAINER_CLASSES starts
+      empty here -- add entries if inspect_samples.py ever turns up a
+      widget being mistaken for body content, same mechanism as Korea
+      Herald.
+    - The site is Next.js-based (CSS-module class names like
+      "Wrapper_wrap__YfhIp" and Suspense ids like "S:1" are build-hash
+      dependent, not stable identifiers) -- no site-specific
+      BODY_SELECTOR_CANDIDATES are hardcoded; body extraction relies on
+      trafilatura first, then the tag-agnostic generic BS4 fallback.
 
-NOT yet verified: the pre-2018 /view.php?ud=YYYYMMDDxxxxxx template. If
-that template lacks JSON-LD/meta tags entirely, affected rows will get
-date_flag="unparsed_date" and empty section/author rather than a guess --
-by design, per the "don't guess a date" requirement. Run inspect_samples.py
-against a few old-format URLs before trusting old-article rows blindly,
-and update this file if the old template needs its own extraction path.
-
-Publication date handling:
-    - We only ever trust an explicitly-labeled "published" field
-      (JSON-LD datePublished, meta article:published_time, or trafilatura's
-      date). We never fall back to a bare `<time>` tag or the date embedded
-      in old-style /view.php?ud=YYYYMMDD... URLs, because we can't be sure
-      that isn't an update date or an ID artifact -- per your instructions,
-      an unreliable date is left empty and flagged (date_flag column)
-      rather than guessed.
-    - If a distinct "updated" timestamp is found, it goes in updated_date,
-      never overwriting publication_date.
+NOT yet verified: URL patterns for non-article pages (photo/video/section
+index/gallery) -- NON_ARTICLE_URL_PATTERNS below are generic guesses
+carried over from Korea Herald, unconfirmed against real Korea Times URLs.
 """
 
 import csv
@@ -77,9 +76,9 @@ except ImportError:
 # Configuration
 # --------------------------------------------------------------------------
 INPUT_FILE = "urls.txt"
-OUTPUT_CSV = "korea_herald_corpus.csv"
-FAILURES_CSV = "scrape_failures.csv"
-RAW_HTML_DIR = "raw_html"
+OUTPUT_CSV = "korea_times_corpus.csv"
+FAILURES_CSV = "korea_times_failures.csv"
+RAW_HTML_DIR = "raw_html_koreatimes"
 
 REQUEST_DELAY_SECONDS = 1.5
 REQUEST_TIMEOUT = 20
@@ -98,37 +97,41 @@ NON_ARTICLE_URL_PATTERNS = [
     r"/tag/", r"/gallery/", r"\.jpg$", r"\.png$", r"/search\.php",
 ]
 
-# Ordered, best-effort fallback selectors for the article body when
-# trafilatura comes back empty/short. Confirmed live: trafilatura succeeds
-# on every current-template article checked so far, so these are still
-# unconfirmed guesses for the rare case it fails -- if inspect_samples.py
-# ever shows a real body container, add it here (highest-confidence first).
-BODY_SELECTOR_CANDIDATES = [
-    ("id", "articleText"),
-    ("id", "articeBody"),
-    ("id", "article-view-content-div"),
-    ("class", "view_con"),
-    ("class", "article-view"),
-    ("class", "article_view"),
-    ("class", "art_body"),
-]
+# No site-specific body selector guesses -- Korea Times' class names are
+# Next.js CSS-module build hashes (e.g. "Wrapper_wrap__YfhIp"), not stable
+# across deploys, so hardcoding one would be fragile. Body extraction
+# relies entirely on trafilatura, then the tag-agnostic generic BS4
+# fallback (<article>/<main>/largest <p>-bearing div) in extract_body_bs4.
+BODY_SELECTOR_CANDIDATES = []
 
-# Confirmed live (2026 template): these divs are "related articles" / "in
-# this section" recirculation widgets that happen to contain several <p>
-# tags, NOT the article body -- e.g. div.div_layout and div#category-N
-# showed the SAME unrelated headlines ("Yangsan hits 42.5 C...") across
-# multiple different articles, confirming they're site-wide chrome, not
-# per-article content. These are decomposed (removed) from the soup before
-# ANY extraction runs (including trafilatura), not just excluded from the
-# BS4 fallback -- trafilatura was otherwise picking up the widget instead
-# of the real (short) article body on at least one confirmed live page.
-NOISE_CONTAINER_CLASSES = {"recommended_swiper_wrap", "recommended_swiper", "div_layout"}
-NOISE_CONTAINER_ID_PREFIXES = ("category-",)
+# Not yet needed: no related-articles/recirculation widget contamination
+# observed in the 2 confirmed samples (trafilatura's extracted length
+# closely tracked the full container length in both). Add entries here,
+# same mechanism as the Korea Herald scraper, if inspect_samples.py ever
+# shows a widget being mistaken for body content.
+NOISE_CONTAINER_CLASSES = set()
+NOISE_CONTAINER_ID_PREFIXES = ()
 
-# Confirmed live: JSON-LD headline and og:title both carry a trailing
-# " - The Korea Herald" suffix (JSON-LD also HTML-entity-encodes
-# apostrophes as &apos;, which json.loads does not decode).
-TITLE_SUFFIX_RE = re.compile(r"\s*-\s*The Korea Herald\s*$", re.IGNORECASE)
+# Confirmed live: og:title carries a trailing " - The Korea Times" suffix
+# (JSON-LD headline is already clean here -- the opposite of Korea
+# Herald -- but clean_title() strips it from whichever source is used
+# regardless, so this is just a safety net).
+TITLE_SUFFIX_RE = re.compile(r"\s*-\s*The Korea Times\s*$", re.IGNORECASE)
+
+# Confirmed live: on at least one old (2007) article, both JSON-LD
+# author.name and meta article:author report the site name instead of a
+# real byline.
+JUNK_AUTHOR_VALUES = {"the korea times"}
+
+# Confirmed live: old articles can carry the byline as literal text at the
+# very start of body_text ("By Cathy Rose A. Garcia\nStaff Reporter\n...")
+# when metadata has no real author. Matches "By <1-5 capitalized words>"
+# as its own line; deliberately requires every word to start uppercase so
+# it can't misfire on real body text that happens to start with "By ...".
+BYLINE_RE = re.compile(r"^By\s+((?:[A-Z][\w.\'-]*\s*){1,5})\n")
+# A short all-letters line immediately after the byline (e.g. "Staff
+# Reporter", "Correspondent") is treated as a role line and stripped too.
+ROLE_LINE_RE = re.compile(r"^[A-Za-z][A-Za-z .]{2,40}$")
 
 CSV_FIELDS = [
     "article_id", "url", "title", "publication_date", "updated_date",
@@ -371,14 +374,45 @@ def extract_body_bs4(soup):
 
 
 def clean_title(title):
-    """Un-escape HTML entities (JSON-LD headline uses &apos; etc.) and
-    strip the trailing ' - The Korea Herald' suffix seen on both JSON-LD
-    headline and og:title."""
+    """Un-escape HTML entities and strip the trailing
+    ' - The Korea Times' suffix, regardless of which source (JSON-LD
+    headline or og:title) it came from."""
     if not title:
         return ""
     title = html.unescape(title)
     title = TITLE_SUFFIX_RE.sub("", title)
     return title.strip()
+
+
+def clean_author(value):
+    """Filter out the junk placeholder author value ("The Korea Times",
+    the site name) seen on at least one old article's JSON-LD/meta."""
+    if not value:
+        return ""
+    if value.strip().lower() in JUNK_AUTHOR_VALUES:
+        return ""
+    return value.strip()
+
+
+def extract_byline_fallback(body_text):
+    """If body_text starts with a 'By <Name>' byline line -- seen on old
+    Korea Times articles that lack a real author in metadata -- pull it
+    out as the author and strip it (plus an immediately-following short
+    role line like 'Staff Reporter') from body_text, so the body stays
+    pure article content. Returns (author, cleaned_body_text); author is
+    "" and body_text is returned unchanged if the pattern doesn't match."""
+    if not body_text:
+        return "", body_text
+    m = BYLINE_RE.match(body_text)
+    if not m:
+        return "", body_text
+    author = m.group(1).strip()
+    remainder = body_text[m.end():]
+    lines = remainder.split("\n", 1)
+    if (len(lines) == 2 and ROLE_LINE_RE.match(lines[0].strip())
+            and len(lines[0].strip().split()) <= 4):
+        remainder = lines[1]
+    return author, remainder.lstrip("\n")
 
 
 def extract_article(html_text, url):
@@ -414,18 +448,31 @@ def extract_article(html_text, url):
     if not body_text:
         body_text, extraction_method = "", "failed"
 
-    # Field priority: confirmed live against real pages.
-    # Title: og:title is already clean; JSON-LD headline is the fallback
-    # (both carry the same site-name suffix / entity-encoding, handled by
-    # clean_title()).
-    title = clean_title(meta.get("title") or jsonld.get("title") or traf_data.get("title") or "")
-    author = jsonld.get("author") or meta.get("author") or traf_data.get("author") or ""
+    # Field priority: confirmed live against real pages. JSON-LD headline
+    # is already clean here; og:title carries the suffix -- either way
+    # clean_title() handles it.
+    title = clean_title(jsonld.get("title") or meta.get("title") or traf_data.get("title") or "")
+    author = (
+        clean_author(jsonld.get("author"))
+        or clean_author(meta.get("author"))
+        or clean_author(traf_data.get("author"))
+        or ""
+    )
+    if not author:
+        # Old articles can carry the byline as literal text at the start
+        # of the body instead of in metadata -- pull it out if present.
+        author, body_text = extract_byline_fallback(body_text)
 
     published_raw = jsonld.get("published_raw") or meta.get("published_raw") or ""
     updated_raw = jsonld.get("updated_raw") or meta.get("updated_raw") or ""
 
     publication_date = parse_iso_date(published_raw)
     updated_date = parse_iso_date(updated_raw)
+
+    # dateModified equals datePublished exactly when an article was never
+    # actually revised (confirmed live) -- don't record a false "update".
+    if updated_date == publication_date:
+        updated_date = None
 
     date_flag = ""
     if not publication_date:
