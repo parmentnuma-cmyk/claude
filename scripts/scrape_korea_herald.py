@@ -10,29 +10,36 @@ OUTPUT: korea_herald_corpus.csv   one row per unique input URL (success or faile
 --------------------------------------------------------------------------
 EXTRACTION NOTES (read this before running on your full list)
 --------------------------------------------------------------------------
-This script was written in an environment that could not reach
-koreaherald.com to inspect live page structure (network policy blocked
-the domain). Rather than hard-code guessed CSS selectors and hope, the
-metadata/date extraction is layered so the most template-agnostic sources
-are tried first:
+Verified against 4 live current-template articles (Jan 2026, /article/<id>
+URLs). Confirmed findings baked into the code below:
 
-    1. JSON-LD (schema.org NewsArticle/Article) <script type="application/ld+json">
-       - the modern, structured-data way of exposing headline, datePublished,
-         dateModified, author, articleSection. Most current news CMSs
-         (Korea Herald included, as of recent template versions) emit this.
-    2. OpenGraph / meta tags (og:title, article:published_time,
-       article:modified_time, article:section, name="author")
-    3. trafilatura's own metadata + text extraction (bundles its own
-       date/author heuristics and is generally robust across templates)
-    4. BeautifulSoup fallback selectors (BODY_SELECTOR_CANDIDATES below) -
-       last resort, tried in order, for body text only.
+    - JSON-LD (schema.org NewsArticle) is present and reliable for
+      datePublished, dateModified (empty string when never updated,
+      never absent), and author.name. It has no articleSection field.
+    - og:title (meta) is clean; JSON-LD's headline carries the same text
+      but with a " - The Korea Herald" suffix and &apos;-style HTML
+      entities instead of real characters -- both handled by clean_title().
+    - article:section (meta) and trafilatura's "categories" are USELESS
+      for section -- both just echo "The Korea Herald" (the site name),
+      not a real section. The real section ("K-pop", "National", "English
+      Cafe", ...) lives in the first ".category" breadcrumb element on the
+      page (extract_section_from_breadcrumb()); a second ".category" match
+      is typically a content-format tag like "Quick Read", not a section.
+    - trafilatura's body extraction was clean on all 4 samples (no nav or
+      "recommended articles" widget contamination) -- it's the primary
+      body extractor. The BS4 fallback path (BODY_SELECTOR_CANDIDATES)
+      remains unconfirmed against a real page since trafilatura hasn't
+      failed yet in samples; its generic largest-div fallback explicitly
+      excludes known related-articles/nav widget containers
+      (BODY_FALLBACK_EXCLUDE_CLASSES/IDS) so it can't silently return the
+      wrong content as a false "success" if it ever does trigger.
 
-Before running on your full 1,600 URLs, run inspect_samples.py (same folder)
-on a handful of real URLs from your list -- including at least one
-pre-2018 article using the old /view.php?ud=YYYYMMDDxxxxxx URL format, in
-case the template differs from current /article/<id> pages. If it reports
-a body container selector that isn't already in BODY_SELECTOR_CANDIDATES,
-add it (highest-confidence first).
+NOT yet verified: the pre-2018 /view.php?ud=YYYYMMDDxxxxxx template. If
+that template lacks JSON-LD/meta tags entirely, affected rows will get
+date_flag="unparsed_date" and empty section/author rather than a guess --
+by design, per the "don't guess a date" requirement. Run inspect_samples.py
+against a few old-format URLs before trusting old-article rows blindly,
+and update this file if the old template needs its own extraction path.
 
 Publication date handling:
     - We only ever trust an explicitly-labeled "published" field
@@ -47,6 +54,7 @@ Publication date handling:
 """
 
 import csv
+import html
 import json
 import os
 import re
@@ -91,9 +99,10 @@ NON_ARTICLE_URL_PATTERNS = [
 ]
 
 # Ordered, best-effort fallback selectors for the article body when
-# trafilatura comes back empty/short. Update this list after running
-# inspect_samples.py against real pages -- these are best-effort guesses,
-# not confirmed against a live page.
+# trafilatura comes back empty/short. Confirmed live: trafilatura succeeds
+# on every current-template article checked so far, so these are still
+# unconfirmed guesses for the rare case it fails -- if inspect_samples.py
+# ever shows a real body container, add it here (highest-confidence first).
 BODY_SELECTOR_CANDIDATES = [
     ("id", "articleText"),
     ("id", "articeBody"),
@@ -103,6 +112,22 @@ BODY_SELECTOR_CANDIDATES = [
     ("class", "article_view"),
     ("class", "art_body"),
 ]
+
+# Confirmed live (2026 template): these divs are "related articles" / nav
+# widgets that happen to contain several <p> tags, NOT the article body.
+# The generic largest-div fallback must never mistake one of these for
+# real content -- that would silently write the wrong text as "success".
+BODY_FALLBACK_EXCLUDE_CLASSES = {"recommended_swiper_wrap", "recommended_swiper", "div_layout"}
+BODY_FALLBACK_EXCLUDE_ID_PREFIXES = ("category-",)
+
+# Confirmed live: article:section meta and trafilatura's "categories" both
+# just echo the site name instead of a real section -- treat as junk.
+JUNK_SECTION_VALUES = {"the korea herald", "korea herald"}
+
+# Confirmed live: JSON-LD headline and og:title both carry a trailing
+# " - The Korea Herald" suffix (JSON-LD also HTML-entity-encodes
+# apostrophes as &apos;, which json.loads does not decode).
+TITLE_SUFFIX_RE = re.compile(r"\s*-\s*The Korea Herald\s*$", re.IGNORECASE)
 
 CSV_FIELDS = [
     "article_id", "url", "title", "publication_date", "updated_date",
@@ -283,12 +308,18 @@ def extract_meta_tag_metadata(soup):
     }
 
 
+def _is_excluded_div(div):
+    classes = set(div.get("class") or [])
+    if classes & BODY_FALLBACK_EXCLUDE_CLASSES:
+        return True
+    div_id = div.get("id") or ""
+    return any(div_id.startswith(p) for p in BODY_FALLBACK_EXCLUDE_ID_PREFIXES)
+
+
 def extract_body_bs4(soup):
     """Last-resort BeautifulSoup body extraction. Returns (text, method) or (None, None)."""
     for attr, value in BODY_SELECTOR_CANDIDATES:
-        el = soup.find(attrs={attr: value}) if attr == "class" else soup.find(id=value)
-        if attr == "class":
-            el = soup.find(class_=value)
+        el = soup.find(class_=value) if attr == "class" else soup.find(id=value)
         if el:
             paragraphs = [p.get_text(" ", strip=True) for p in el.find_all("p")]
             paragraphs = [p for p in paragraphs if p]
@@ -297,6 +328,7 @@ def extract_body_bs4(soup):
                 return text, f"bs4_selector:{attr}={value}"
 
     # generic fallback: <article> or <main>, else largest <p>-bearing div
+    # (never the known related-articles/nav widgets)
     for tag_name in ("article", "main"):
         el = soup.find(tag_name)
         if el:
@@ -308,6 +340,8 @@ def extract_body_bs4(soup):
 
     best_text, best_len = None, 0
     for div in soup.find_all("div"):
+        if _is_excluded_div(div):
+            continue
         paragraphs = [p.get_text(" ", strip=True) for p in div.find_all("p", recursive=False)]
         paragraphs = [p for p in paragraphs if p]
         text = "\n".join(paragraphs)
@@ -317,6 +351,39 @@ def extract_body_bs4(soup):
         return best_text, "bs4_generic:largest_div"
 
     return None, None
+
+
+def clean_title(title):
+    """Un-escape HTML entities (JSON-LD headline uses &apos; etc.) and
+    strip the trailing ' - The Korea Herald' suffix seen on both JSON-LD
+    headline and og:title."""
+    if not title:
+        return ""
+    title = html.unescape(title)
+    title = TITLE_SUFFIX_RE.sub("", title)
+    return title.strip()
+
+
+def clean_section(value):
+    """Filter out junk section values that are just the site name echoed
+    back (seen from article:section meta and trafilatura's categories)."""
+    if not value:
+        return ""
+    if value.strip().lower() in JUNK_SECTION_VALUES:
+        return ""
+    return value.strip()
+
+
+def extract_section_from_breadcrumb(soup):
+    """The real section (e.g. 'K-pop', 'National', 'English Cafe') lives in
+    the first '.category' element on the page; a second one is typically a
+    content-format tag like 'Quick Read', not a section."""
+    els = soup.select(".category")
+    if els:
+        text = els[0].get_text(strip=True)
+        if text:
+            return text
+    return ""
 
 
 def extract_article(html, url):
@@ -346,10 +413,22 @@ def extract_article(html, url):
     if not body_text:
         body_text, extraction_method = "", "failed"
 
-    # Field priority: JSON-LD > meta tags > trafilatura
-    title = jsonld.get("title") or meta.get("title") or traf_data.get("title") or ""
+    # Field priority: confirmed live against real pages.
+    # Title: og:title is already clean; JSON-LD headline is the fallback
+    # (both carry the same site-name suffix / entity-encoding, handled by
+    # clean_title()).
+    title = clean_title(meta.get("title") or jsonld.get("title") or traf_data.get("title") or "")
     author = jsonld.get("author") or meta.get("author") or traf_data.get("author") or ""
-    section = jsonld.get("section") or meta.get("section") or traf_data.get("categories") or ""
+    # Section: breadcrumb ".category" is the only reliable source seen so
+    # far -- article:section meta and trafilatura's categories both just
+    # echo the site name (filtered out by clean_section()).
+    section = (
+        extract_section_from_breadcrumb(soup)
+        or clean_section(jsonld.get("section"))
+        or clean_section(meta.get("section"))
+        or clean_section(traf_data.get("categories"))
+        or ""
+    )
     if isinstance(section, list):
         section = ", ".join(section)
 
