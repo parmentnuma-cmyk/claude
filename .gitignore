@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+raw_html/
+*.csv
+urls.txt
