@@ -65,8 +65,8 @@ def main():
     print()
     print(f"Flagging articles with body_text under {SHORT_ARTICLE_WORD_THRESHOLD} words "
           f"as possible extraction failures...")
-    success_df["word_count"] = pd.to_numeric(success_df["word_count"], errors="coerce").fillna(0)
-    short_articles = success_df[success_df["word_count"] < SHORT_ARTICLE_WORD_THRESHOLD]
+    word_counts = success_df["body_text"].astype(str).str.split().str.len()
+    short_articles = success_df[word_counts < SHORT_ARTICLE_WORD_THRESHOLD]
     short_articles.to_csv(REVIEW_CSV, index=False)
     print(f"  {len(short_articles)} short articles written to {REVIEW_CSV}")
 
@@ -84,7 +84,6 @@ def main():
             print("-" * 70)
             print(f"[{row['article_id']}] {row['title']}")
             print(f"  date: {row['publication_date'] or '(none)'}  "
-                  f"section: {row.get('section', '')}  "
                   f"method: {row.get('extraction_method', '')}")
             body = str(row["body_text"])
             print(f"  body: {body[:200]!r}")

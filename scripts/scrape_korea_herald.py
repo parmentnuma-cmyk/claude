@@ -120,10 +120,6 @@ BODY_SELECTOR_CANDIDATES = [
 BODY_FALLBACK_EXCLUDE_CLASSES = {"recommended_swiper_wrap", "recommended_swiper", "div_layout"}
 BODY_FALLBACK_EXCLUDE_ID_PREFIXES = ("category-",)
 
-# Confirmed live: article:section meta and trafilatura's "categories" both
-# just echo the site name instead of a real section -- treat as junk.
-JUNK_SECTION_VALUES = {"the korea herald", "korea herald"}
-
 # Confirmed live: JSON-LD headline and og:title both carry a trailing
 # " - The Korea Herald" suffix (JSON-LD also HTML-entity-encodes
 # apostrophes as &apos;, which json.loads does not decode).
@@ -131,7 +127,7 @@ TITLE_SUFFIX_RE = re.compile(r"\s*-\s*The Korea Herald\s*$", re.IGNORECASE)
 
 CSV_FIELDS = [
     "article_id", "url", "title", "publication_date", "updated_date",
-    "date_flag", "author", "section", "body_text", "word_count",
+    "date_flag", "author", "body_text",
     "extraction_method", "scrape_status", "scrape_timestamp",
 ]
 
@@ -280,14 +276,9 @@ def extract_jsonld_metadata(soup):
             elif isinstance(author_field, str):
                 author = author_field
 
-            section = item.get("articleSection", "")
-            if isinstance(section, list):
-                section = ", ".join(str(s) for s in section)
-
             return {
                 "title": item.get("headline", "") or "",
                 "author": author,
-                "section": str(section) if section else "",
                 "published_raw": item.get("datePublished", ""),
                 "updated_raw": item.get("dateModified", ""),
             }
@@ -302,7 +293,6 @@ def extract_meta_tag_metadata(soup):
     return {
         "title": meta_content("og:title") or meta_content("twitter:title"),
         "author": meta_content("author") or meta_content("article:author"),
-        "section": meta_content("article:section") or meta_content("og:section"),
         "published_raw": meta_content("article:published_time"),
         "updated_raw": meta_content("article:modified_time") or meta_content("og:updated_time"),
     }
@@ -364,28 +354,6 @@ def clean_title(title):
     return title.strip()
 
 
-def clean_section(value):
-    """Filter out junk section values that are just the site name echoed
-    back (seen from article:section meta and trafilatura's categories)."""
-    if not value:
-        return ""
-    if value.strip().lower() in JUNK_SECTION_VALUES:
-        return ""
-    return value.strip()
-
-
-def extract_section_from_breadcrumb(soup):
-    """The real section (e.g. 'K-pop', 'National', 'English Cafe') lives in
-    the first '.category' element on the page; a second one is typically a
-    content-format tag like 'Quick Read', not a section."""
-    els = soup.select(".category")
-    if els:
-        text = els[0].get_text(strip=True)
-        if text:
-            return text
-    return ""
-
-
 def extract_article(html, url):
     """
     Returns a dict with title, author, section, body_text, word_count,
@@ -419,18 +387,6 @@ def extract_article(html, url):
     # clean_title()).
     title = clean_title(meta.get("title") or jsonld.get("title") or traf_data.get("title") or "")
     author = jsonld.get("author") or meta.get("author") or traf_data.get("author") or ""
-    # Section: breadcrumb ".category" is the only reliable source seen so
-    # far -- article:section meta and trafilatura's categories both just
-    # echo the site name (filtered out by clean_section()).
-    section = (
-        extract_section_from_breadcrumb(soup)
-        or clean_section(jsonld.get("section"))
-        or clean_section(meta.get("section"))
-        or clean_section(traf_data.get("categories"))
-        or ""
-    )
-    if isinstance(section, list):
-        section = ", ".join(section)
 
     published_raw = jsonld.get("published_raw") or meta.get("published_raw") or ""
     updated_raw = jsonld.get("updated_raw") or meta.get("updated_raw") or ""
@@ -450,14 +406,10 @@ def extract_article(html, url):
         if not publication_date:
             date_flag = "unparsed_date"
 
-    word_count = len(body_text.split()) if body_text else 0
-
     return {
         "title": title.strip(),
         "author": author.strip(),
-        "section": section.strip() if isinstance(section, str) else "",
         "body_text": body_text,
-        "word_count": word_count,
         "publication_date": publication_date.isoformat() if publication_date else "",
         "updated_date": updated_date.isoformat() if updated_date else "",
         "date_flag": date_flag,
@@ -475,8 +427,8 @@ def scrape_one(session, article_id, url):
     if is_non_article_url(url):
         corpus_row = {
             "article_id": article_id, "url": url, "title": "", "publication_date": "",
-            "updated_date": "", "date_flag": "", "author": "", "section": "",
-            "body_text": "", "word_count": 0, "extraction_method": "",
+            "updated_date": "", "date_flag": "", "author": "",
+            "body_text": "", "extraction_method": "",
             "scrape_status": "failed", "scrape_timestamp": now,
         }
         failure_row = {
@@ -514,8 +466,8 @@ def scrape_one(session, article_id, url):
             "article_id": article_id, "url": url, "title": extracted["title"],
             "publication_date": extracted["publication_date"],
             "updated_date": extracted["updated_date"], "date_flag": extracted["date_flag"],
-            "author": extracted["author"], "section": extracted["section"],
-            "body_text": "", "word_count": 0, "extraction_method": "failed",
+            "author": extracted["author"],
+            "body_text": "", "extraction_method": "failed",
             "scrape_status": "failed", "scrape_timestamp": now,
         }
         failure_row = {
@@ -529,8 +481,8 @@ def scrape_one(session, article_id, url):
         "article_id": article_id, "url": url, "title": extracted["title"],
         "publication_date": extracted["publication_date"],
         "updated_date": extracted["updated_date"], "date_flag": extracted["date_flag"],
-        "author": extracted["author"], "section": extracted["section"],
-        "body_text": extracted["body_text"], "word_count": extracted["word_count"],
+        "author": extracted["author"],
+        "body_text": extracted["body_text"],
         "extraction_method": extracted["extraction_method"],
         "scrape_status": "success", "scrape_timestamp": now,
     }
@@ -540,8 +492,8 @@ def scrape_one(session, article_id, url):
 def _failure(article_id, url, now, error_type, status_code, message):
     corpus_row = {
         "article_id": article_id, "url": url, "title": "", "publication_date": "",
-        "updated_date": "", "date_flag": "", "author": "", "section": "",
-        "body_text": "", "word_count": 0, "extraction_method": "",
+        "updated_date": "", "date_flag": "", "author": "",
+        "body_text": "", "extraction_method": "",
         "scrape_status": "failed", "scrape_timestamp": now,
     }
     failure_row = {
