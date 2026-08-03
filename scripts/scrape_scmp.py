@@ -33,14 +33,18 @@ these confirmed SCMP-specific findings:
     - Confirmed bug, now fixed: body_text was leaking non-body content at
       the very start in 4 of 5 samples -- the headline repeated verbatim
       (SCMP's <article> starts with an <h1> matching the headline, which
-      trafilatura/BS4 both include as if it were a paragraph), sometimes
-      followed by a "- <sentence>" line that exactly matches the meta
-      description (SCMP's "deck" summary bullet UI), and in one sample
-      even a literal "Advertisement" placeholder line before the headline
-      repeat. strip_leading_boilerplate() removes these known non-body
-      lines from the start of body_text (matched against the
-      already-extracted title/description, or an exact "Advertisement"
-      line) -- run repeatedly since more than one can stack at the start.
+      trafilatura/BS4 both include as if it were a paragraph), and in one
+      sample a literal "Advertisement" placeholder line before that.
+      strip_leading_boilerplate() removes these two known non-body lines
+      from the start of body_text (matched against the already-extracted
+      title, or an exact "Advertisement" line), repeatedly since both can
+      stack. An earlier version of this fix also tried to strip a leading
+      "- <sentence>" deck-bullet line by matching it against the meta
+      description -- dropped after checking FULL (not 150-char-preview-
+      truncated) body text showed articles can have TWO such bullets, and
+      their text often doesn't match the meta description once you see
+      the whole sentence. Those bullets are genuine "at a glance" summary
+      content, not boilerplate, so they're deliberately left in place.
     - dateModified is always present (never an empty string) and often
       differs from datePublished by only minutes on the same calendar
       day -- same date-equality suppression as Korea Times applies
@@ -309,7 +313,6 @@ def extract_meta_tag_metadata(soup):
         "author": meta_content("author") or meta_content("article:author"),
         "published_raw": meta_content("article:published_time"),
         "updated_raw": meta_content("article:modified_time") or meta_content("og:updated_time"),
-        "description": meta_content("description"),
     }
 
 
@@ -391,14 +394,23 @@ def clean_title(title):
     return title.strip()
 
 
-def strip_leading_boilerplate(body_text, title, description):
+def strip_leading_boilerplate(body_text, title):
     """Confirmed live: body_text can start with a literal "Advertisement"
     placeholder line, then the article's own headline repeated verbatim
     (the <article> element's <h1> gets extracted as if it were a body
-    paragraph), then sometimes a "- <sentence>" line that's an exact
-    match for the meta description (SCMP's "deck" summary bullet UI).
-    Strips any of these found at the very start, repeatedly, since more
-    than one can stack (e.g. Advertisement + headline repeat together)."""
+    paragraph). Strips these if found at the very start, repeatedly,
+    since both can stack together.
+
+    NOTE: an earlier version of this function also tried to strip a
+    leading "- <sentence>" deck-bullet line by matching it against the
+    meta description -- dropped after checking full (not just
+    150-char-preview-truncated) body text on 5 real articles showed that
+    match only ever worked by truncation-coincidence: articles can have
+    TWO deck bullets, and their text often doesn't match the meta
+    description at all once you see the whole sentence. Those bullets are
+    genuine "at a glance" editorial summary content, not boilerplate, so
+    they're deliberately left in body_text rather than guessed at and
+    stripped on an unreliable heuristic."""
     if not body_text:
         return body_text
     lines = body_text.split("\n")
@@ -419,12 +431,6 @@ def strip_leading_boilerplate(body_text, title, description):
             lines.pop(0)
             changed = True
             continue
-        if description and first.startswith("-"):
-            remainder = first.lstrip("-").strip()
-            if remainder.casefold() == description.strip().casefold():
-                lines.pop(0)
-                changed = True
-                continue
     return "\n".join(lines).lstrip("\n")
 
 
@@ -461,12 +467,11 @@ def extract_article(html_text, url):
     if not body_text:
         body_text, extraction_method = "", "failed"
     else:
-        # Strip the confirmed-live headline-repeat / deck-bullet /
-        # "Advertisement" noise that can lead body_text (see docstring).
+        # Strip the confirmed-live headline-repeat / "Advertisement"
+        # noise that can lead body_text (see docstring).
         body_text = strip_leading_boilerplate(
             body_text,
             jsonld.get("title") or meta.get("title") or "",
-            meta.get("description") or "",
         )
 
     # Field priority: confirmed live against real pages. JSON-LD headline
